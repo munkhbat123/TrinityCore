@@ -1,6 +1,5 @@
 /*
- * Copyright (C) 2008-2013 TrinityCore <http://www.trinitycore.org/>
- * Copyright (C) 2006-2009 ScriptDev2 <https://scriptdev2.svn.sourceforge.net/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -19,7 +18,12 @@
 #ifndef DEF_TEMPLE_OF_AHNQIRAJ_H
 #define DEF_TEMPLE_OF_AHNQIRAJ_H
 
-enum DataTypes
+#include "CreatureAIImpl.h"
+
+#define AQ40ScriptName "instance_temple_of_ahnqiraj"
+#define DataHeader "AQT"
+
+enum AQTDataTypes
 {
     DATA_SKERAM             = 1,
     DATA_KRI                = 2,
@@ -37,18 +41,18 @@ enum DataTypes
     DATA_VISCIDUS           = 21
 };
 
-enum Creatures
+enum AQTCreatures
 {
     BOSS_EYE_OF_CTHUN       = 15589,
-    MOB_CTHUN_PORTAL        = 15896,
-    MOB_CLAW_TENTACLE       = 15725,
-    MOB_EYE_TENTACLE        = 15726,
-    MOB_SMALL_PORTAL        = 15904,
-    MOB_BODY_OF_CTHUN       = 15809,
-    MOB_GIANT_CLAW_TENTACLE = 15728,
-    MOB_GIANT_EYE_TENTACLE  = 15334,
-    MOB_FLESH_TENTACLE      = 15802,
-    MOB_GIANT_PORTAL        = 15910,
+    NPC_CTHUN_PORTAL        = 15896,
+    NPC_CLAW_TENTACLE       = 15725,
+    NPC_EYE_TENTACLE        = 15726,
+    NPC_SMALL_PORTAL        = 15904,
+    NPC_BODY_OF_CTHUN       = 15809,
+    NPC_GIANT_CLAW_TENTACLE = 15728,
+    NPC_GIANT_EYE_TENTACLE  = 15334,
+    NPC_FLESH_TENTACLE      = 15802,
+    NPC_GIANT_PORTAL        = 15910,
 
     NPC_VISCIDUS            = 15299,
     NPC_GLOB_OF_VISCIDUS    = 15667,
@@ -59,5 +63,11 @@ enum Creatures
     NPC_VEKLOR              = 15276,
     NPC_VEKNILASH           = 15275
 };
-#endif
 
+template<typename AI>
+inline AI* GetAQ40AI(Creature* creature)
+{
+    return GetInstanceAI<AI>(creature, AQ40ScriptName);
+}
+
+#endif

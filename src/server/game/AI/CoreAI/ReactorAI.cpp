@@ -1,6 +1,5 @@
 /*
- * Copyright (C) 2008-2013 TrinityCore <http://www.trinitycore.org/>
- * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -16,16 +15,12 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "ByteBuffer.h"
 #include "ReactorAI.h"
-#include "Errors.h"
-#include "Log.h"
-#include "ObjectAccessor.h"
-#include "CreatureAIImpl.h"
+#include "Creature.h"
 
-int ReactorAI::Permissible(const Creature* creature)
+int32 ReactorAI::Permissible(Creature const* creature)
 {
-    if (creature->isCivilian() || creature->IsNeutralToAll())
+    if (creature->IsCivilian() || creature->IsNeutralToAll())
         return PERMIT_BASE_REACTIVE;
 
     return PERMIT_BASE_NO;

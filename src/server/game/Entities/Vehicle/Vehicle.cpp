@@ -1,6 +1,5 @@
 /*
- * Copyright (C) 2008-2013 TrinityCore <http://www.trinitycore.org/>
- * Copyright (C) 2005-2009 MaNGOS <http://getmangos.com/>
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -16,30 +15,28 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "Common.h"
-#include "Log.h"
-#include "ObjectMgr.h"
 #include "Vehicle.h"
+#include "Battleground.h"
+#include "Common.h"
+#include "CreatureAI.h"
+#include "DB2Stores.h"
+#include "EventProcessor.h"
+#include "Log.h"
+#include "MoveSplineInit.h"
+#include "ObjectAccessor.h"
+#include "ObjectMgr.h"
+#include "Player.h"
+#include "ScriptMgr.h"
+#include "TemporarySummon.h"
 #include "Unit.h"
 #include "Util.h"
-#include "WorldPacket.h"
-#include "ScriptMgr.h"
-#include "CreatureAI.h"
-#include "ZoneScript.h"
-#include "SpellMgr.h"
-#include "SpellInfo.h"
-#include "MoveSplineInit.h"
-#include "TemporarySummon.h"
-#include "EventProcessor.h"
-#include "Player.h"
-#include "Battleground.h"
 
 Vehicle::Vehicle(Unit* unit, VehicleEntry const* vehInfo, uint32 creatureEntry) :
-UsableSeatNum(0), _me(unit), _vehicleInfo(vehInfo), _creatureEntry(creatureEntry), _status(STATUS_NONE)
+UsableSeatNum(0), _me(unit), _vehicleInfo(vehInfo), _creatureEntry(creatureEntry), _status(STATUS_NONE), _lastShootPos()
 {
-    for (uint32 i = 0; i < MAX_VEHICLE_SEATS; ++i)
+    for (int8 i = 0; i < MAX_VEHICLE_SEATS; ++i)
     {
-        if (uint32 seatId = _vehicleInfo->m_seatID[i])
+        if (uint32 seatId = _vehicleInfo->SeatID[i])
             if (VehicleSeatEntry const* veSeat = sVehicleSeatStore.LookupEntry(seatId))
             {
                 Seats.insert(std::make_pair(i, VehicleSeat(veSeat)));
@@ -50,9 +47,9 @@ UsableSeatNum(0), _me(unit), _vehicleInfo(vehInfo), _creatureEntry(creatureEntry
 
     // Set or remove correct flags based on available seats. Will overwrite db data (if wrong).
     if (UsableSeatNum)
-        _me->SetFlag(UNIT_NPC_FLAGS, (_me->GetTypeId() == TYPEID_PLAYER ? UNIT_NPC_FLAG_PLAYER_VEHICLE : UNIT_NPC_FLAG_SPELLCLICK));
+        _me->AddNpcFlag((_me->GetTypeId() == TYPEID_PLAYER ? UNIT_NPC_FLAG_PLAYER_VEHICLE : UNIT_NPC_FLAG_SPELLCLICK));
     else
-        _me->RemoveFlag(UNIT_NPC_FLAGS, (_me->GetTypeId() == TYPEID_PLAYER ? UNIT_NPC_FLAG_PLAYER_VEHICLE : UNIT_NPC_FLAG_SPELLCLICK));
+        _me->RemoveNpcFlag((_me->GetTypeId() == TYPEID_PLAYER ? UNIT_NPC_FLAG_PLAYER_VEHICLE : UNIT_NPC_FLAG_SPELLCLICK));
 
     InitMovementInfoForBase();
 }
@@ -62,7 +59,7 @@ Vehicle::~Vehicle()
     /// @Uninstall must be called before this.
     ASSERT(_status == STATUS_UNINSTALLING);
     for (SeatMap::const_iterator itr = Seats.begin(); itr != Seats.end(); ++itr)
-        ASSERT(!itr->second.Passenger);
+        ASSERT(itr->second.IsEmpty());
 }
 
 /**
@@ -76,41 +73,12 @@ Vehicle::~Vehicle()
 
 void Vehicle::Install()
 {
-    if (Creature* creature = _me->ToCreature())
+    if (_me->GetTypeId() == TYPEID_UNIT)
     {
-        switch (_vehicleInfo->m_powerType)
-        {
-            case POWER_STEAM:
-            case POWER_HEAT:
-            case POWER_BLOOD:
-            case POWER_OOZE:
-            case POWER_WRATH:
-                _me->setPowerType(POWER_ENERGY);
-                _me->SetMaxPower(POWER_ENERGY, 100);
-                break;
-            case POWER_PYRITE:
-                _me->setPowerType(POWER_ENERGY);
-                _me->SetMaxPower(POWER_ENERGY, 50);
-                break;
-            default:
-                for (uint32 i = 0; i < MAX_SPELL_VEHICLE; ++i)
-                {
-                    if (!creature->m_spells[i])
-                        continue;
-
-                    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(creature->m_spells[i]);
-                    if (!spellInfo)
-                        continue;
-
-                    if (spellInfo->PowerType == POWER_ENERGY)
-                    {
-                        _me->setPowerType(POWER_ENERGY);
-                        _me->SetMaxPower(POWER_ENERGY, 100);
-                        break;
-                    }
-                }
-                break;
-        }
+        if (PowerDisplayEntry const* powerDisplay = sPowerDisplayStore.LookupEntry(_vehicleInfo->PowerDisplayID[0]))
+            _me->SetPowerType(Powers(powerDisplay->ActualType));
+        else if (_me->getClass() == CLASS_ROGUE)
+            _me->SetPowerType(POWER_ENERGY);
     }
 
     _status = STATUS_INSTALLED;
@@ -147,13 +115,13 @@ void Vehicle::Uninstall()
     /// @Prevent recursive uninstall call. (Bad script in OnUninstall/OnRemovePassenger/PassengerBoarded hook.)
     if (_status == STATUS_UNINSTALLING && !GetBase()->HasUnitTypeMask(UNIT_MASK_MINION))
     {
-        sLog->outError(LOG_FILTER_VEHICLES, "Vehicle GuidLow: %u, Entry: %u attempts to uninstall, but already has STATUS_UNINSTALLING! "
-            "Check Uninstall/PassengerBoarded script hooks for errors.", _me->GetGUIDLow(), _me->GetEntry());
+        TC_LOG_ERROR("entities.vehicle", "%s, Entry: %u attempts to uninstall, but already has STATUS_UNINSTALLING! "
+            "Check Uninstall/PassengerBoarded script hooks for errors.", _me->GetGUID().ToString().c_str(), _creatureEntry);
         return;
     }
 
     _status = STATUS_UNINSTALLING;
-    sLog->outDebug(LOG_FILTER_VEHICLES, "Vehicle::Uninstall Entry: %u, GuidLow: %u", _creatureEntry, _me->GetGUIDLow());
+    TC_LOG_DEBUG("entities.vehicle", "Vehicle::Uninstall Entry: %u, %s", _creatureEntry, _me->GetGUID().ToString().c_str());
     RemoveAllPassengers();
 
     if (GetBase()->GetTypeId() == TYPEID_UNIT)
@@ -176,7 +144,7 @@ void Vehicle::Reset(bool evading /*= false*/)
     if (GetBase()->GetTypeId() != TYPEID_UNIT)
         return;
 
-    sLog->outDebug(LOG_FILTER_VEHICLES, "Vehicle::Reset (Entry: %u, GuidLow: %u, DBGuid: %u)", GetCreatureEntry(), _me->GetGUIDLow(), _me->ToCreature()->GetDBTableGUIDLow());
+    TC_LOG_DEBUG("entities.vehicle", "Vehicle::Reset (Entry: %u, %s, DBGuid: " UI64FMTD ")", GetCreatureEntry(), _me->GetGUID().ToString().c_str(), _me->ToCreature()->GetSpawnId());
 
     ApplyAllImmunities();
     InstallAllAccessories(evading);
@@ -214,6 +182,7 @@ void Vehicle::ApplyAllImmunities()
         _me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_SCHOOL_IMMUNITY, true);
         _me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_MOD_UNATTACKABLE, true);
         _me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_SCHOOL_ABSORB, true);
+        _me->ApplySpellImmune(0, IMMUNITY_MECHANIC, MECHANIC_BANISH, true);
         _me->ApplySpellImmune(0, IMMUNITY_MECHANIC, MECHANIC_SHIELD, true);
         _me->ApplySpellImmune(0, IMMUNITY_MECHANIC, MECHANIC_IMMUNE_SHIELD, true);
 
@@ -226,15 +195,22 @@ void Vehicle::ApplyAllImmunities()
     }
 
     // Different immunities for vehicles goes below
-    switch (GetVehicleInfo()->m_ID)
+    switch (GetVehicleInfo()->ID)
     {
         // code below prevents a bug with movable cannons
         case 160: // Strand of the Ancients
         case 244: // Wintergrasp
         case 510: // Isle of Conquest
+        case 452: // Isle of Conquest
+        case 543: // Isle of Conquest
             _me->SetControlled(true, UNIT_STATE_ROOT);
             // why we need to apply this? we can simple add immunities to slow mechanic in DB
             _me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_MOD_DECREASE_SPEED, true);
+            break;
+        case 335: // Salvaged Chopper
+        case 336: // Salvaged Siege Engine
+        case 338: // Salvaged Demolisher
+            _me->ApplySpellImmune(0, IMMUNITY_STATE, SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN, false); // Battering Ram
             break;
         default:
             break;
@@ -252,7 +228,7 @@ void Vehicle::ApplyAllImmunities()
 
 void Vehicle::RemoveAllPassengers()
 {
-    sLog->outDebug(LOG_FILTER_VEHICLES, "Vehicle::RemoveAllPassengers. Entry: %u, GuidLow: %u", _creatureEntry, _me->GetGUIDLow());
+    TC_LOG_DEBUG("entities.vehicle", "Vehicle::RemoveAllPassengers. Entry: %u, %s", _creatureEntry, _me->GetGUID().ToString().c_str());
 
     /// Setting to_Abort to true will cause @VehicleJoinEvent::Abort to be executed on next @Unit::UpdateEvents call
     /// This will properly "reset" the pending join process for the passenger.
@@ -263,7 +239,7 @@ void Vehicle::RemoveAllPassengers()
         while (!_pendingJoinEvents.empty())
         {
             VehicleJoinEvent* e = _pendingJoinEvents.front();
-            e->to_Abort = true;
+            e->ScheduleAbort();
             e->Target = eventVehicle;
             _pendingJoinEvents.pop_front();
         }
@@ -299,7 +275,7 @@ bool Vehicle::HasEmptySeat(int8 seatId) const
     SeatMap::const_iterator seat = Seats.find(seatId);
     if (seat == Seats.end())
         return false;
-    return !seat->second.Passenger;
+    return seat->second.IsEmpty();
 }
 
 /**
@@ -321,7 +297,7 @@ Unit* Vehicle::GetPassenger(int8 seatId) const
     if (seat == Seats.end())
         return NULL;
 
-    return ObjectAccessor::GetUnit(*GetBase(), seat->second.Passenger);
+    return ObjectAccessor::GetUnit(*GetBase(), seat->second.Passenger.Guid);
 }
 
 /**
@@ -344,7 +320,7 @@ SeatMap::const_iterator Vehicle::GetNextEmptySeat(int8 seatId, bool next) const
     if (seat == Seats.end())
         return seat;
 
-    while (seat->second.Passenger || (!seat->second.SeatInfo->CanEnterOrExit() && !seat->second.SeatInfo->IsUsableByOverride()))
+    while (!seat->second.IsEmpty() || (!seat->second.SeatInfo->CanEnterOrExit() && !seat->second.SeatInfo->IsUsableByOverride()))
     {
         if (next)
         {
@@ -353,8 +329,9 @@ SeatMap::const_iterator Vehicle::GetNextEmptySeat(int8 seatId, bool next) const
         }
         else
         {
-            if (seat-- == Seats.begin())
+            if (seat == Seats.begin())
                 seat = Seats.end();
+            --seat;
         }
 
         // Make sure we don't loop indefinetly
@@ -387,15 +364,13 @@ void Vehicle::InstallAccessory(uint32 entry, int8 seatId, bool minion, uint8 typ
     /// @Prevent adding accessories when vehicle is uninstalling. (Bad script in OnUninstall/OnRemovePassenger/PassengerBoarded hook.)
     if (_status == STATUS_UNINSTALLING)
     {
-        sLog->outError(LOG_FILTER_VEHICLES, "Vehicle (GuidLow: %u, DB GUID: %u, Entry: %u) attempts to install accessory (Entry: %u) on seat %d with STATUS_UNINSTALLING! "
-            "Check Uninstall/PassengerBoarded script hooks for errors.", _me->GetGUIDLow(),
-            (_me->GetTypeId() == TYPEID_UNIT ? _me->ToCreature()->GetDBTableGUIDLow() : _me->GetGUIDLow()), GetCreatureEntry(), entry, (int32)seatId);
+        TC_LOG_ERROR("entities.vehicle", "Vehicle (%s, Entry: %u) attempts to install accessory (Entry: %u) on seat %d with STATUS_UNINSTALLING! "
+            "Check Uninstall/PassengerBoarded script hooks for errors.", _me->GetGUID().ToString().c_str(), GetCreatureEntry(), entry, (int32)seatId);
         return;
     }
 
-    sLog->outDebug(LOG_FILTER_VEHICLES, "Vehicle (GuidLow: %u, DB Guid: %u, Entry %u): installing accessory (Entry: %u) on seat: %d",
-        _me->GetGUIDLow(), (_me->GetTypeId() == TYPEID_UNIT ? _me->ToCreature()->GetDBTableGUIDLow() : _me->GetGUIDLow()), GetCreatureEntry(),
-        entry, (int32)seatId);
+    TC_LOG_DEBUG("entities.vehicle", "Vehicle (%s, Entry %u): installing accessory (Entry: %u) on seat: %d",
+        _me->GetGUID().ToString().c_str(), GetCreatureEntry(), entry, (int32)seatId);
 
     TempSummon* accessory = _me->SummonCreature(entry, *_me, TempSummonType(type), summonTime);
     ASSERT(accessory);
@@ -417,7 +392,7 @@ void Vehicle::InstallAccessory(uint32 entry, int8 seatId, bool minion, uint8 typ
  * @author Machiavelli
  * @date 17-2-2013
  *
- * @param [in,out] The prospective passenger.
+ * @param [in, out] The prospective passenger.
  * @param seatId        Identifier for the seat. Value of -1 indicates the next available seat.
  *
  * @return true if it succeeds, false if it fails.
@@ -428,14 +403,14 @@ bool Vehicle::AddPassenger(Unit* unit, int8 seatId)
     /// @Prevent adding passengers when vehicle is uninstalling. (Bad script in OnUninstall/OnRemovePassenger/PassengerBoarded hook.)
     if (_status == STATUS_UNINSTALLING)
     {
-        sLog->outError(LOG_FILTER_VEHICLES, "Passenger GuidLow: %u, Entry: %u, attempting to board vehicle GuidLow: %u, Entry: %u during uninstall! SeatId: %d",
-            unit->GetGUIDLow(), unit->GetEntry(), _me->GetGUIDLow(), _me->GetEntry(), (int32)seatId);
+        TC_LOG_ERROR("entities.vehicle", "Passenger %s, Entry: %u, attempting to board %s, Entry: %u during uninstall! SeatId: %d",
+            unit->GetGUID().ToString().c_str(), unit->GetEntry(), _me->GetGUID().ToString().c_str(), _me->GetEntry(), (int32)seatId);
         return false;
     }
 
-    sLog->outDebug(LOG_FILTER_VEHICLES, "Unit %s scheduling enter vehicle (entry: %u, vehicleId: %u, guid: %u (dbguid: %u) on seat %d",
-        unit->GetName().c_str(), _me->GetEntry(), _vehicleInfo->m_ID, _me->GetGUIDLow(),
-        (_me->GetTypeId() == TYPEID_UNIT ? _me->ToCreature()->GetDBTableGUIDLow() : 0), (int32)seatId);
+    TC_LOG_DEBUG("entities.vehicle", "Unit %s scheduling enter vehicle (entry: %u, vehicleId: %u, %s (dbguid: " UI64FMTD ") on seat %d",
+        unit->GetName().c_str(), _me->GetEntry(), _vehicleInfo->ID, _me->GetGUID().ToString().c_str(),
+        uint64(_me->GetTypeId() == TYPEID_UNIT ? _me->ToCreature()->GetSpawnId() : UI64LIT(0)), (int32)seatId);
 
     // The seat selection code may kick other passengers off the vehicle.
     // While the validity of the following may be arguable, it is possible that when such a passenger
@@ -448,12 +423,12 @@ bool Vehicle::AddPassenger(Unit* unit, int8 seatId)
     if (seatId < 0) // no specific seat requirement
     {
         for (seat = Seats.begin(); seat != Seats.end(); ++seat)
-            if (!seat->second.Passenger && (seat->second.SeatInfo->CanEnterOrExit() || seat->second.SeatInfo->IsUsableByOverride()))
+            if (seat->second.IsEmpty() && (seat->second.SeatInfo->CanEnterOrExit() || seat->second.SeatInfo->IsUsableByOverride()))
                 break;
 
         if (seat == Seats.end()) // no available seat
         {
-            e->to_Abort = true;
+            e->ScheduleAbort();
             return false;
         }
 
@@ -465,20 +440,20 @@ bool Vehicle::AddPassenger(Unit* unit, int8 seatId)
         seat = Seats.find(seatId);
         if (seat == Seats.end())
         {
-            e->to_Abort = true;
+            e->ScheduleAbort();
             return false;
         }
 
         e->Seat = seat;
         _pendingJoinEvents.push_back(e);
-        if (seat->second.Passenger)
+        if (!seat->second.IsEmpty())
         {
-            Unit* passenger = ObjectAccessor::GetUnit(*GetBase(), seat->second.Passenger);
+            Unit* passenger = ObjectAccessor::GetUnit(*GetBase(), seat->second.Passenger.Guid);
             ASSERT(passenger);
             passenger->ExitVehicle();
         }
 
-        ASSERT(!seat->second.Passenger);
+        ASSERT(seat->second.IsEmpty());
     }
 
     return true;
@@ -492,35 +467,42 @@ bool Vehicle::AddPassenger(Unit* unit, int8 seatId)
  * @author Machiavelli
  * @date 17-2-2013
  *
- * @param [in,out] unit The passenger to remove.
+ * @param [in, out] unit The passenger to remove.
  */
 
-void Vehicle::RemovePassenger(Unit* unit)
+Vehicle* Vehicle::RemovePassenger(Unit* unit)
 {
     if (unit->GetVehicle() != this)
-        return;
+        return NULL;
 
     SeatMap::iterator seat = GetSeatIteratorForPassenger(unit);
     ASSERT(seat != Seats.end());
 
-    sLog->outDebug(LOG_FILTER_VEHICLES, "Unit %s exit vehicle entry %u id %u dbguid %u seat %d",
-        unit->GetName().c_str(), _me->GetEntry(), _vehicleInfo->m_ID, _me->GetGUIDLow(), (int32)seat->first);
+    TC_LOG_DEBUG("entities.vehicle", "Unit %s exit vehicle entry %u id %u %s seat %d",
+        unit->GetName().c_str(), _me->GetEntry(), _vehicleInfo->ID, _me->GetGUID().ToString().c_str(), (int32)seat->first);
 
-    seat->second.Passenger = 0;
     if (seat->second.SeatInfo->CanEnterOrExit() && ++UsableSeatNum)
-        _me->SetFlag(UNIT_NPC_FLAGS, (_me->GetTypeId() == TYPEID_PLAYER ? UNIT_NPC_FLAG_PLAYER_VEHICLE : UNIT_NPC_FLAG_SPELLCLICK));
+        _me->AddNpcFlag((_me->GetTypeId() == TYPEID_PLAYER ? UNIT_NPC_FLAG_PLAYER_VEHICLE : UNIT_NPC_FLAG_SPELLCLICK));
 
-    unit->ClearUnitState(UNIT_STATE_ONVEHICLE);
+    // Enable gravity for passenger when he did not have it active before entering the vehicle
+    if (seat->second.SeatInfo->Flags & VEHICLE_SEAT_FLAG_DISABLE_GRAVITY && !seat->second.Passenger.IsGravityDisabled)
+        unit->SetDisableGravity(false);
 
-    if (_me->GetTypeId() == TYPEID_UNIT && unit->GetTypeId() == TYPEID_PLAYER && seat->second.SeatInfo->m_flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
+    // Remove UNIT_FLAG_NOT_SELECTABLE if passenger did not have it before entering vehicle
+    if (seat->second.SeatInfo->Flags & VEHICLE_SEAT_FLAG_PASSENGER_NOT_SELECTABLE && !seat->second.Passenger.IsUnselectable)
+        unit->RemoveUnitFlag(UNIT_FLAG_NOT_SELECTABLE);
+
+    seat->second.Passenger.Reset();
+
+    if (_me->GetTypeId() == TYPEID_UNIT && unit->GetTypeId() == TYPEID_PLAYER && seat->second.SeatInfo->Flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
         _me->RemoveCharmedBy(unit);
 
     if (_me->IsInWorld())
     {
-        unit->RemoveUnitMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
-        unit->m_movementInfo.t_pos.Relocate(0.0f, 0.0f, 0.0f, 0.0f);
-        unit->m_movementInfo.t_time = 0;
-        unit->m_movementInfo.t_seat = 0;
+        if (!_me->GetTransport())
+            unit->m_movementInfo.ResetTransport();
+        else
+            unit->m_movementInfo.transport = _me->m_movementInfo.transport;
     }
 
     // only for flyable vehicles
@@ -532,6 +514,9 @@ void Vehicle::RemovePassenger(Unit* unit)
 
     if (GetBase()->GetTypeId() == TYPEID_UNIT)
         sScriptMgr->OnRemovePassenger(this, unit);
+
+    unit->SetVehicle(NULL);
+    return this;
 }
 
 /**
@@ -547,19 +532,26 @@ void Vehicle::RelocatePassengers()
 {
     ASSERT(_me->GetMap());
 
+    std::vector<std::pair<Unit*, Position>> seatRelocation;
+    seatRelocation.reserve(Seats.size());
+
     // not sure that absolute position calculation is correct, it must depend on vehicle pitch angle
     for (SeatMap::const_iterator itr = Seats.begin(); itr != Seats.end(); ++itr)
     {
-        if (Unit* passenger = ObjectAccessor::GetUnit(*GetBase(), itr->second.Passenger))
+        if (Unit* passenger = ObjectAccessor::GetUnit(*GetBase(), itr->second.Passenger.Guid))
         {
             ASSERT(passenger->IsInWorld());
 
             float px, py, pz, po;
-            passenger->m_movementInfo.t_pos.GetPosition(px, py, pz, po);
-            CalculatePassengerPosition(px, py, pz, po);
-            passenger->UpdatePosition(px, py, pz, po);
+            passenger->m_movementInfo.transport.pos.GetPosition(px, py, pz, po);
+            CalculatePassengerPosition(px, py, pz, &po);
+
+            seatRelocation.emplace_back(passenger, Position(px, py, pz, po));
         }
     }
+
+    for (auto const& pair : seatRelocation)
+        pair.first->UpdatePosition(pair.second);
 }
 
 /**
@@ -576,7 +568,7 @@ void Vehicle::RelocatePassengers()
 bool Vehicle::IsVehicleInUse() const
 {
     for (SeatMap::const_iterator itr = Seats.begin(); itr != Seats.end(); ++itr)
-        if (itr->second.Passenger)
+        if (!itr->second.IsEmpty())
             return true;
 
     return false;
@@ -593,7 +585,7 @@ bool Vehicle::IsVehicleInUse() const
 
 void Vehicle::InitMovementInfoForBase()
 {
-    uint32 vehicleFlags = GetVehicleInfo()->m_flags;
+    uint32 vehicleFlags = GetVehicleInfo()->Flags;
 
     if (vehicleFlags & VEHICLE_FLAG_NO_STRAFE)
         _me->AddExtraUnitMovementFlag(MOVEMENTFLAG2_NO_STRAFE);
@@ -615,7 +607,7 @@ void Vehicle::InitMovementInfoForBase()
  * @author Machiavelli
  * @date 17-2-2013
  *
- * @param [in,out] The passenger for which we check the seat info.
+ * @param [in, out] The passenger for which we check the seat info.
  *
  * @return null if passenger not found on vehicle, else the DBC record for the seat.
  */
@@ -623,7 +615,7 @@ void Vehicle::InitMovementInfoForBase()
 VehicleSeatEntry const* Vehicle::GetSeatForPassenger(Unit const* passenger) const
 {
     for (SeatMap::const_iterator itr = Seats.begin(); itr != Seats.end(); ++itr)
-        if (itr->second.Passenger == passenger->GetGUID())
+        if (itr->second.Passenger.Guid == passenger->GetGUID())
             return itr->second.SeatInfo;
 
     return NULL;
@@ -637,7 +629,7 @@ VehicleSeatEntry const* Vehicle::GetSeatForPassenger(Unit const* passenger) cons
  * @author Machiavelli
  * @date 17-2-2013
  *
- * @param [in,out] passenger Passenger to look up.
+ * @param [in, out] passenger Passenger to look up.
  *
  * @return The seat iterator for specified passenger if it's found on the vehicle. Otherwise Seats.end() (invalid iterator).
  */
@@ -646,7 +638,7 @@ SeatMap::iterator Vehicle::GetSeatIteratorForPassenger(Unit* passenger)
 {
     SeatMap::iterator itr;
     for (itr = Seats.begin(); itr != Seats.end(); ++itr)
-        if (itr->second.Passenger == passenger->GetGUID())
+        if (itr->second.Passenger.Guid == passenger->GetGUID())
             return itr;
 
     return Seats.end();
@@ -668,30 +660,10 @@ uint8 Vehicle::GetAvailableSeatCount() const
     uint8 ret = 0;
     SeatMap::const_iterator itr;
     for (itr = Seats.begin(); itr != Seats.end(); ++itr)
-        if (!itr->second.Passenger && (itr->second.SeatInfo->CanEnterOrExit() || itr->second.SeatInfo->IsUsableByOverride()))
+        if (itr->second.IsEmpty() && (itr->second.SeatInfo->CanEnterOrExit() || itr->second.SeatInfo->IsUsableByOverride()))
             ++ret;
 
     return ret;
-}
-
-void Vehicle::CalculatePassengerPosition(float& x, float& y, float& z, float& o) const
-{
-    float inx = x, iny = y, inz = z, ino = o;
-    o = GetBase()->GetOrientation() + ino;
-    x = GetBase()->GetPositionX() + inx * std::cos(GetBase()->GetOrientation()) - iny * std::sin(GetBase()->GetOrientation());
-    y = GetBase()->GetPositionY() + iny * std::cos(GetBase()->GetOrientation()) + inx * std::sin(GetBase()->GetOrientation());
-    z = GetBase()->GetPositionZ() + inz;
-}
-
-void Vehicle::CalculatePassengerOffset(float& x, float& y, float& z, float& o) const
-{
-    o -= GetBase()->GetOrientation();
-    z -= GetBase()->GetPositionZ();
-    y -= GetBase()->GetPositionY();    // y = searchedY * std::cos(o) + searchedX * std::sin(o)
-    x -= GetBase()->GetPositionX();    // x = searchedX * std::cos(o) + searchedY * std::sin(o + pi)
-    float inx = x, iny = y;
-    y = (iny - inx * tan(GetBase()->GetOrientation())) / (cos(GetBase()->GetOrientation()) + std::sin(GetBase()->GetOrientation()) * tan(GetBase()->GetOrientation()));
-    x = (inx + iny * tan(GetBase()->GetOrientation())) / (cos(GetBase()->GetOrientation()) + std::sin(GetBase()->GetOrientation()) * tan(GetBase()->GetOrientation()));
 }
 
 /**
@@ -736,7 +708,7 @@ void Vehicle::RemovePendingEventsForSeat(int8 seatId)
     {
         if ((*itr)->Seat->first == seatId)
         {
-            (*itr)->to_Abort = true;
+            (*itr)->ScheduleAbort();
             _pendingJoinEvents.erase(itr++);
         }
         else
@@ -761,18 +733,12 @@ void Vehicle::RemovePendingEventsForPassenger(Unit* passenger)
     {
         if ((*itr)->Passenger == passenger)
         {
-            (*itr)->to_Abort = true;
+            (*itr)->ScheduleAbort();
             _pendingJoinEvents.erase(itr++);
         }
         else
             ++itr;
     }
-}
-
-VehicleJoinEvent::~VehicleJoinEvent()
-{
-    if (Target)
-        Target->RemovePendingEvent(this);
 }
 
 /**
@@ -797,9 +763,12 @@ bool VehicleJoinEvent::Execute(uint64, uint32)
     ASSERT(Target->GetBase()->HasAuraTypeWithCaster(SPELL_AURA_CONTROL_VEHICLE, Passenger->GetGUID()));
 
     Target->RemovePendingEventsForSeat(Seat->first);
+    Target->RemovePendingEventsForPassenger(Passenger);
 
-    Passenger->m_vehicle = Target;
-    Seat->second.Passenger = Passenger->GetGUID();
+    Passenger->SetVehicle(Target);
+    Seat->second.Passenger.Guid = Passenger->GetGUID();
+    Seat->second.Passenger.IsUnselectable = Passenger->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE);
+    Seat->second.Passenger.IsGravityDisabled = Passenger->HasUnitMovementFlag(MOVEMENTFLAG_DISABLE_GRAVITY);
     if (Seat->second.SeatInfo->CanEnterOrExit())
     {
         ASSERT(Target->UsableSeatNum);
@@ -807,14 +776,16 @@ bool VehicleJoinEvent::Execute(uint64, uint32)
         if (!Target->UsableSeatNum)
         {
             if (Target->GetBase()->GetTypeId() == TYPEID_PLAYER)
-                Target->GetBase()->RemoveFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_PLAYER_VEHICLE);
+                Target->GetBase()->RemoveNpcFlag(UNIT_NPC_FLAG_PLAYER_VEHICLE);
             else
-                Target->GetBase()->RemoveFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_SPELLCLICK);
+                Target->GetBase()->RemoveNpcFlag(UNIT_NPC_FLAG_SPELLCLICK);
         }
     }
 
     Passenger->InterruptNonMeleeSpells(false);
     Passenger->RemoveAurasByType(SPELL_AURA_MOUNTED);
+
+    VehicleSeatEntry const* veSeat = Seat->second.SeatInfo;
 
     Player* player = Passenger->ToPlayer();
     if (player)
@@ -826,21 +797,24 @@ bool VehicleJoinEvent::Execute(uint64, uint32)
         player->StopCastingCharm();
         player->StopCastingBindSight();
         player->SendOnCancelExpectedVehicleRideAura();
-        player->UnsummonPetTemporaryIfAny();
+        if (!(veSeat->FlagsB & VEHICLE_SEAT_FLAG_B_KEEP_PET))
+            player->UnsummonPetTemporaryIfAny();
     }
 
-    if (Seat->second.SeatInfo->m_flags && !(Seat->second.SeatInfo->m_flags & VEHICLE_SEAT_FLAG_ALLOW_TURNING))
-        Passenger->AddUnitState(UNIT_STATE_ONVEHICLE);
+    if (veSeat->Flags & VEHICLE_SEAT_FLAG_DISABLE_GRAVITY)
+        Passenger->SetDisableGravity(true);
 
-    Passenger->AddUnitMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
-    VehicleSeatEntry const* veSeat = Seat->second.SeatInfo;
-    Passenger->m_movementInfo.t_pos.Relocate(veSeat->m_attachmentOffsetX, veSeat->m_attachmentOffsetY, veSeat->m_attachmentOffsetZ);
-    Passenger->m_movementInfo.t_time = 0; // 1 for player
-    Passenger->m_movementInfo.t_seat = Seat->first;
-    Passenger->m_movementInfo.t_guid = Target->GetBase()->GetGUID();
+    if (Seat->second.SeatInfo->Flags & VEHICLE_SEAT_FLAG_PASSENGER_NOT_SELECTABLE)
+        Passenger->AddUnitFlag(UNIT_FLAG_NOT_SELECTABLE);
+
+    Passenger->m_movementInfo.transport.pos.Relocate(veSeat->AttachmentOffset.X, veSeat->AttachmentOffset.Y, veSeat->AttachmentOffset.Z);
+    Passenger->m_movementInfo.transport.time = 0;
+    Passenger->m_movementInfo.transport.seat = Seat->first;
+    Passenger->m_movementInfo.transport.guid = Target->GetBase()->GetGUID();
+    Passenger->m_movementInfo.transport.vehicleId = Target->GetVehicleInfo()->ID;
 
     if (Target->GetBase()->GetTypeId() == TYPEID_UNIT && Passenger->GetTypeId() == TYPEID_PLAYER &&
-        Seat->second.SeatInfo->m_flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
+        Seat->second.SeatInfo->Flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
         ASSERT(Target->GetBase()->SetCharmedBy(Passenger, CHARM_TYPE_VEHICLE));  // SMSG_CLIENT_CONTROL
 
     Passenger->SendClearTarget();                            // SMSG_BREAK_TARGET
@@ -849,7 +823,7 @@ bool VehicleJoinEvent::Execute(uint64, uint32)
 
     Movement::MoveSplineInit init(Passenger);
     init.DisableTransportPathTransformations();
-    init.MoveTo(veSeat->m_attachmentOffsetX, veSeat->m_attachmentOffsetY, veSeat->m_attachmentOffsetZ, false, true);
+    init.MoveTo(veSeat->AttachmentOffset.X, veSeat->AttachmentOffset.Y, veSeat->AttachmentOffset.Z, false, true);
     init.SetFacing(0.0f);
     init.SetTransportEnter();
     init.Launch();
@@ -885,8 +859,11 @@ void VehicleJoinEvent::Abort(uint64)
     /// Check if the Vehicle was already uninstalled, in which case all auras were removed already
     if (Target)
     {
-        sLog->outDebug(LOG_FILTER_VEHICLES, "Passenger GuidLow: %u, Entry: %u, board on vehicle GuidLow: %u, Entry: %u SeatId: %d cancelled",
-            Passenger->GetGUIDLow(), Passenger->GetEntry(), Target->GetBase()->GetGUIDLow(), Target->GetBase()->GetEntry(), (int32)Seat->first);
+        TC_LOG_DEBUG("entities.vehicle", "Passenger %s, Entry: %u, board on vehicle %s, Entry: %u SeatId: %d cancelled",
+            Passenger->GetGUID().ToString().c_str(), Passenger->GetEntry(), Target->GetBase()->GetGUID().ToString().c_str(), Target->GetBase()->GetEntry(), (int32)Seat->first);
+
+        /// Remove the pending event when Abort was called on the event directly
+        Target->RemovePendingEvent(this);
 
         /// @SPELL_AURA_CONTROL_VEHICLE auras can be applied even when the passenger is not (yet) on the vehicle.
         /// When this code is triggered it means that something went wrong in @Vehicle::AddPassenger, and we should remove
@@ -894,8 +871,8 @@ void VehicleJoinEvent::Abort(uint64)
         Target->GetBase()->RemoveAurasByType(SPELL_AURA_CONTROL_VEHICLE, Passenger->GetGUID());
     }
     else
-        sLog->outDebug(LOG_FILTER_VEHICLES, "Passenger GuidLow: %u, Entry: %u, board on uninstalled vehicle SeatId: %d cancelled",
-            Passenger->GetGUIDLow(), Passenger->GetEntry(), (int32)Seat->first);
+        TC_LOG_DEBUG("entities.vehicle", "Passenger %s, Entry: %u, board on uninstalled vehicle SeatId: %d cancelled",
+            Passenger->GetGUID().ToString().c_str(), Passenger->GetEntry(), (int32)Seat->first);
 
     if (Passenger->IsInWorld() && Passenger->HasUnitTypeMask(UNIT_MASK_ACCESSORY))
         Passenger->ToCreature()->DespawnOrUnsummon();
